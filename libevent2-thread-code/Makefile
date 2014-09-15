@@ -3,7 +3,7 @@ LDFLAGS=-levent -lpthread
 LIBS=workqueue.o
 HEADERS=workqueue.h
 BINS=echoserver_threaded
-
+CC=g++
 all: ${BINS}
 
 echoserver_threaded: echoserver_threaded.o ${LIBS} ${HEADERS}

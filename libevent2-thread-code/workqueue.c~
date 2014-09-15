@@ -67,7 +67,7 @@ int workqueue_init(workqueue_t *workqueue, int numWorkers) {
     memcpy(&workqueue->jobs_cond, &blank_cond, sizeof(workqueue->jobs_cond));
 
     for (i = 0; i < numWorkers; i++) {
-        if ((worker = (worker_t*)malloc(sizeof(worker_t))) == NULL) {
+        if ((worker = malloc(sizeof(worker_t))) == NULL) {
             perror("Failed to allocate all workers");
             return 1;
         }
