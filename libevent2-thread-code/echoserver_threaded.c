@@ -42,7 +42,7 @@
 	fprintf(stderr, "%s:%d: %s():\t", __FILE__, __LINE__, __FUNCTION__);\
 	fprintf(stderr, __VA_ARGS__);\
 }
-
+char *ROOT_PATH = "/home/mike";
 /**
  * Struct to carry around connection (client)-specific data.
  */
@@ -62,6 +62,18 @@ typedef struct client {
 	/* Here you can add your own application-specific attributes which
 	 * are connection-specific. */
 } client_t;
+
+typedef enum {
+	GET,
+	HEAD,
+	UNKNOWN
+} command_t;
+
+typedef enum {
+	OK,
+	NOT_FOUND,
+	BAD_REQUEST
+} status_t;
 
 static struct event_base *evbase_accept;
 static workqueue_t workqueue;
@@ -97,13 +109,23 @@ static void closeAndFreeClient(client_t *client) {
 	}
 }
 
+int getDepth(char *path) {
+	int depth = 0;
+	char *ch = strtok(path, "/");
+	while(ch != NULL) {
+		if(!strcmp(ch, ".."))
+			--depth;
+		else
+			++depth;
+		ch = strtok(NULL, "/");
+	}
+	return depth;
+}
 /**
  * Called by libevent when there is data to read.
  */
 void buffered_on_read(struct bufferevent *bev, void *arg) {
 	client_t *client = (client_t *)arg;
-	char data[4096];
-	int nbytes;
 	char *line;
 	size_t n;
 	/* If we have input data, the number of bytes we have is contained in
@@ -113,13 +135,39 @@ void buffered_on_read(struct bufferevent *bev, void *arg) {
 	 * reading and writing of the input and output buffers, so we won't take
 	 * that shortcut here. */
 	struct evbuffer *input =  bufferevent_get_input(bev);
+	line = evbuffer_readln(input, &n, EVBUFFER_EOL_CRLF);
+	char cmd[256], protocol[256], path[1024];
+	command_t command = UNKNOWN;
+	status_t status;
+	if (n != 0) {
+		int scaned = sscanf(line, "%s %s %s", cmd, path, protocol);
+		if (scaned == 3) {
+			if (!strcmp(cmd, "GET")) {
+				command = GET;
+			}
+			else if (!strcmp(cmd, "HEAD")) {
+				command = HEAD;
+			}
+			if (!strcmp(protocol, "HTTP/1.1")) {
+					status = BAD_REQUEST;
+			}
+			printf("%d\n", getDepth(path));
+			//printf("PROTOCOL: %s\n", protocol);
+			//printf("PATH: %s\n", path);
+			//printf("cmd: %s\n", cmd);
+		}
+		else {
+			printf("405\n");
+		}
+	}
+	free(line);
+	evbuffer_add(client->output_buffer, "AAA", 3);
+	/*
 	while ((line = evbuffer_readln(input, &n, EVBUFFER_EOL_CRLF))) {
-		printf("%s\n", line);
 		evbuffer_add(client->output_buffer, line, n);
 		evbuffer_add(client->output_buffer, "\n", 1);
 		free(line);
-	}
-    printf("OUT %d\n", client->fd);
+	}*/
 	//evbuffer_add_printf(client->output_buffer, "HTTP/1.1 200 OK\r\rContent-Type: text/html\r\nDate: Sun, 14 Sep 2014 08:39:53 GMT\r\nContent-Length: 5\r\n\r\n OKK\r\n");
 	//  while (evbuffer_get_length(input) > 0) {
 	/* Remove a chunk of data from the input buffer, copying it into our
@@ -167,7 +215,6 @@ static void server_job_function(struct job *job) {
  * ready to be accepted.
  */
 void on_accept(evutil_socket_t fd, short ev, void *arg) {
-    printf("OnAccept\n");
 	int client_fd;
 	struct sockaddr_in client_addr;
 	socklen_t client_len = sizeof(client_addr);
