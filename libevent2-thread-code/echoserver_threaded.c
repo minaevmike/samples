@@ -19,15 +19,25 @@
 #include <unistd.h>
 #include <errno.h>
 #include <err.h>
+#include <time.h>
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
 #include <event2/listener.h>
 #include <event2/util.h>
 #include <event2/event.h>
 #include <signal.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <map>
+#include <fstream>
+#include <iostream>
 
-#include "workqueue.h"
-
+//#include "workqueue.h"
+bool volatile isRun = true;
 /* Port to listen on. */
 #define SERVER_PORT 5555
 /* Connection backlog (# of backlogged connections to accept). */
@@ -42,7 +52,9 @@
 	fprintf(stderr, "%s:%d: %s():\t", __FILE__, __LINE__, __FUNCTION__);\
 	fprintf(stderr, __VA_ARGS__);\
 }
-char *ROOT_PATH = "/home/mike";
+
+#define MAX_PATH_SIZE 1024
+#define ROOT_PATH "/home/mike/"
 /**
  * Struct to carry around connection (client)-specific data.
  */
@@ -58,7 +70,8 @@ typedef struct client {
 
 	/* The output buffer for this client. */
 	struct evbuffer *output_buffer;
-
+	
+	int openFd;
 	/* Here you can add your own application-specific attributes which
 	 * are connection-specific. */
 } client_t;
@@ -66,7 +79,7 @@ typedef struct client {
 typedef enum {
 	GET,
 	HEAD,
-	UNKNOWN
+	UNKNOWN_C
 } command_t;
 
 typedef enum {
@@ -75,14 +88,38 @@ typedef enum {
 	BAD_REQUEST
 } status_t;
 
+typedef enum {
+	HTML,
+	JPEG,
+	JPG,
+	PNG,
+	CSS,
+	JS,
+	GIF,
+	SWF,
+	UNKNOWN_T
+} contentType_t;
+
+typedef struct httpHeader {
+	command_t command;
+	status_t status;
+	long length;
+	contentType_t type;
+} httpHeader_t;
+
 static struct event_base *evbase_accept;
-static workqueue_t workqueue;
+//static workqueue_t workqueue;
 
 /* Signal handler function (defined below). */
 static void sighandler(int signal);
 
 static void closeClient(client_t *client) {
+	printf("close\n");
 	if (client != NULL) {
+		if (client->openFd >= 0) {
+			close(client->openFd);
+			client->openFd = -1;
+		}
 		if (client->fd >= 0) {
 			close(client->fd);
 			client->fd = -1;
@@ -91,6 +128,7 @@ static void closeClient(client_t *client) {
 }
 
 static void closeAndFreeClient(client_t *client) {
+	printf("close and free\n");
 	if (client != NULL) {
 		closeClient(client);
 		if (client->buf_ev != NULL) {
@@ -109,6 +147,61 @@ static void closeAndFreeClient(client_t *client) {
 	}
 }
 
+contentType_t getContentType(char* path) {
+	contentType_t type;
+	char buf[256] = {'\0'};
+	char *pch = strrchr(path, '.');
+	if (pch != NULL) {
+		memcpy(buf, pch + 1, strlen(path) - (pch - path) - 1);
+		if (!strcmp(buf, "html"))
+			type = HTML;
+		else if (!strcmp(buf, "png"))
+			type = PNG;
+		else if (!strcmp(buf, "jpg"))
+			type = JPG;
+		else if (!strcmp(buf, "jpeg"))
+			type = JPEG;
+		else if (!strcmp(buf, "css"))
+			type = CSS;
+		else if (!strcmp(buf, "js"))
+			type = JS;
+		else if (!strcmp(buf, "gif"))
+			type = GIF;
+		else if (!strcmp(buf, "swf"))
+			type = SWF;
+		else 
+			type = UNKNOWN_T;
+	}
+	else {
+		type = UNKNOWN_T;
+	}
+	return type;
+}
+
+void urlDecode(char *str) {
+	char tmp[MAX_PATH_SIZE] = {0};
+	char *pch = strrchr(str, '?');
+	unsigned int i;
+	if (pch != NULL)
+		str[pch - str] = '\0';
+	pch = tmp;
+	for(i = 0; i < strlen(str); i++) {
+		if (str[i] != '%') {
+			*pch++ = str[i];
+			continue;
+		}
+		if (!isdigit(str[i+1]) || !isdigit(str[i+2])){
+			*pch++ = str[i];
+			continue;
+		}
+		*pch++ = ((str[i+1] - '0') << 4) | (str[i+2] - '0');
+		i+=2;
+	}
+	*pch = '\0';
+	strcpy(str, tmp);
+}
+
+
 int getDepth(char *path) {
 	int depth = 0;
 	char *ch = strtok(path, "/");
@@ -117,9 +210,66 @@ int getDepth(char *path) {
 			--depth;
 		else
 			++depth;
+		if(depth < 0)
+			return -1;
 		ch = strtok(NULL, "/");
 	}
 	return depth;
+}
+
+void addHeader(httpHeader_t *h, struct evbuffer *buf) {
+	if(h->status == OK) {
+		//print response
+		evbuffer_add_printf(buf, "HTTP/1.1 200 OK\n");
+		char timeStr[64] = {'\0'};
+		time_t now = time(NULL);
+		strftime(timeStr, 64, "%Y-%m-%d %H:%M:%S", localtime(&now));
+		//print date
+		evbuffer_add_printf(buf, "Date: %s\n", timeStr);
+		//print server
+		evbuffer_add_printf(buf, "Server: BESTEUSERVER\n");
+		//print content type
+		evbuffer_add_printf(buf, "Content-Type: ");
+		switch(h->type) {
+			case HTML:
+				evbuffer_add_printf(buf, "text/html");
+				break;
+			case JPEG:
+			case JPG:
+				evbuffer_add_printf(buf, "image/jpeg");
+				break;
+			case PNG:
+				evbuffer_add_printf(buf, "image/png");
+				break;
+			case CSS:
+				evbuffer_add_printf(buf, "text/css");
+				break;
+			case JS:
+				evbuffer_add_printf(buf, "application/x-javascript");
+				break;
+			case GIF:
+				evbuffer_add_printf(buf, "image/gif");
+				break;
+			case SWF:
+				evbuffer_add_printf(buf, "application/x-shockwave-flash");
+				break;
+			default:
+				evbuffer_add_printf(buf, "text/html");
+		}
+		evbuffer_add_printf(buf, "\n");
+		//print content length
+		evbuffer_add_printf(buf, "Content-Length: %lu\n", h->length);
+		//print connection close
+		evbuffer_add_printf(buf, "Connection: close\n\n");
+	}
+}
+/**
+ * Called by libevent when the write buffer reaches 0.  We only
+ * provide this because libevent expects it, but we don't use it.
+ */
+void buffered_on_write(struct bufferevent *bev, void *arg) {
+	printf("On write\n");
+	//closeClient((client_t *) arg);
 }
 /**
  * Called by libevent when there is data to read.
@@ -136,32 +286,100 @@ void buffered_on_read(struct bufferevent *bev, void *arg) {
 	 * that shortcut here. */
 	struct evbuffer *input =  bufferevent_get_input(bev);
 	line = evbuffer_readln(input, &n, EVBUFFER_EOL_CRLF);
-	char cmd[256], protocol[256], path[1024];
-	command_t command = UNKNOWN;
-	status_t status;
+	char cmd[256], protocol[256], path[MAX_PATH_SIZE];
+	httpHeader_t httpHeader;
+	httpHeader.command = UNKNOWN_C;
+	httpHeader.status = OK;
 	if (n != 0) {
-		int scaned = sscanf(line, "%s %s %s", cmd, path, protocol);
+		int scaned = sscanf(line, "%s %s %s\n", cmd, path, protocol);
 		if (scaned == 3) {
 			if (!strcmp(cmd, "GET")) {
-				command = GET;
+				httpHeader.command = GET;
 			}
 			else if (!strcmp(cmd, "HEAD")) {
-				command = HEAD;
+				httpHeader.command = HEAD;
 			}
-			if (!strcmp(protocol, "HTTP/1.1")) {
-					status = BAD_REQUEST;
+			else { 
+				httpHeader.command = UNKNOWN_C;
 			}
-			printf("%d\n", getDepth(path));
-			//printf("PROTOCOL: %s\n", protocol);
-			//printf("PATH: %s\n", path);
-			//printf("cmd: %s\n", cmd);
+		/*	if (strcmp(protocol, "HTTP/1.1")) {
+				printf("BAD PROTOCOL%s\n", protocol);
+				httpHeader.status = BAD_REQUEST;
+			}*/
+			if (path[0] != '/') {
+				printf("BAD INPUtT\n");
+				httpHeader.status = BAD_REQUEST;
+			}
+			urlDecode(path);
+			httpHeader.type = getContentType(path);
+			if (getDepth(path) == -1) {
+				printf("BAD DEPTH\n");
+				httpHeader.status = BAD_REQUEST;
+			}
 		}
 		else {
-			printf("405\n");
+			printf("Bad scanned\n");
+			httpHeader.status = BAD_REQUEST;
 		}
 	}
+	else {
+		printf("OOO BAD N\n");
+		httpHeader.status = BAD_REQUEST;
+	}
+	switch (httpHeader.status) {
+		case BAD_REQUEST:
+			printf("Bad request\n");
+			break;
+		case OK:
+			printf("OK\n");
+			break;
+		case NOT_FOUND:
+			printf("NOt found\n");
+			break;
+	}
+	switch (httpHeader.command) {
+		case UNKNOWN_C:
+			printf("UNKNOWS\n");
+			break;
+		case GET:
+			printf("GET\n");
+			break;
+		case HEAD:
+			printf("HEAD\n");
+			break;
+	}
+	printf("%s\n", path);
 	free(line);
-	evbuffer_add(client->output_buffer, "AAA", 3);
+	if (httpHeader.status != BAD_REQUEST) {
+		char fullPath[2048] = {'\0'};
+		strcpy(fullPath, ROOT_PATH);
+		strcat(fullPath, path);
+		int fd = open(fullPath, O_RDONLY);
+		if (fd < 0) {
+			httpHeader.status = NOT_FOUND;
+			printf("Can't open %s", fullPath);
+		}
+		client->openFd = -1;
+		struct stat st;
+		httpHeader.length = lseek(fd, 0, SEEK_END);
+		if (httpHeader.length == -1 || lseek(fd, 0, SEEK_SET) == -1) {
+			httpHeader.status = BAD_REQUEST;
+			printf("Cant seek\n");
+		}
+		addHeader(&httpHeader, client->output_buffer);
+		if (fstat(fd, &st) < 0) {
+			perror("fstat");
+		}
+		if (fd != -1 && httpHeader.status == OK && httpHeader.command == GET) {
+			evbuffer_set_flags(client->output_buffer, EVBUFFER_FLAG_DRAINS_TO_FD);
+			if(evbuffer_add_file(client->output_buffer, fd, 0, httpHeader.length) != 0) {
+				perror("add file");
+			}
+		}
+	//	printf("%d\n", fd);
+	}
+
+	//evbuffer_add(client->output_buffer, "AAA", 3);
 	/*
 	while ((line = evbuffer_readln(input, &n, EVBUFFER_EOL_CRLF))) {
 		evbuffer_add(client->output_buffer, line, n);
@@ -181,24 +399,21 @@ void buffered_on_read(struct bufferevent *bev, void *arg) {
 
 	/* Send the results to the client.  This actually only queues the results
 	 * for sending. Sending will occur asynchronously, handled by libevent. */
-	if (bufferevent_write_buffer(bev, client->output_buffer)) {
+	if (bufferevent_write_buffer(bev, client->output_buffer) == -1) {
 		errorOut("Error sending data to client on fd %d\n", client->fd);
-		closeClient(client);
 	}
+
+	//bufferevent_setcb(bev, NULL, buffered_on_write, NULL, NULL);
+	//bufferevent_enable(bev, EV_WRITE);
 }
 
-/**
- * Called by libevent when the write buffer reaches 0.  We only
- * provide this because libevent expects it, but we don't use it.
- */
-void buffered_on_write(struct bufferevent *bev, void *arg) {
-}
 
 /**
  * Called by libevent when there is an error on the underlying socket
  * descriptor.
  */
 void buffered_on_error(struct bufferevent *bev, short what, void *arg) {
+	printf("an error: %s\n", strerror(errno));
 	closeClient((client_t *)arg);
 }
 
@@ -218,7 +433,7 @@ void on_accept(evutil_socket_t fd, short ev, void *arg) {
 	int client_fd;
 	struct sockaddr_in client_addr;
 	socklen_t client_len = sizeof(client_addr);
-	workqueue_t *workqueue = (workqueue_t *)arg;
+	//workqueue_t *workqueue = (workqueue_t *)arg;
 	client_t *client;
 	job_t *job;
 
@@ -243,7 +458,7 @@ void on_accept(evutil_socket_t fd, short ev, void *arg) {
 	}
 	memset(client, 0, sizeof(*client));
 	client->fd = client_fd;
-
+	client->openFd = -1;
 	/* Add any custom code anywhere from here to the end of this function
 	 * to initialize your application-specific attributes in the client struct.
 	 */
@@ -306,7 +521,7 @@ void on_accept(evutil_socket_t fd, short ev, void *arg) {
 	job->job_function = server_job_function;
 	job->user_data = client;
 
-	workqueue_add_job(workqueue, job);
+	//workqueue_add_job(workqueue, job);
 }
 
 /**
@@ -364,17 +579,36 @@ int runServer(void) {
 	}
 
 	/* Initialize work queue. */
-	if (workqueue_init(&workqueue, NUM_THREADS)) {
+	/*if (workqueue_init(&workqueue, NUM_THREADS)) {
 		perror("Failed to create work queue");
 		close(listenfd);
 		workqueue_shutdown(&workqueue);
 		return 1;
-	}
+	}*/
 
 	/* We now have a listening socket, we create a read event to
 	 * be notified when a client connects. */
+	std::ios::sync_with_stdio(false);
+	try {
+		auto threadDeleter = [&] (std::thread *t) { isRun = false; t->join(); delete t; };
+		typedef std::unique_ptr<std::thread, decltype(threadDeleter)> threadPtr;
+		typedef std::vector<threadPtr> threadPool;
+		threadPool threads;
+		for (int i = 0 ; i < NUM_THREADS; ++i)
+		{
+			threadPtr t(new std::thread(requestThread), threadDeleter);
+			std::this_thread::sleep_for(std::chrono::milliseconds(500));
+			threads.push_back(std::move(t));
+		}
+		std::cin.get();
+		isRun = false;
+	} catch (std::exception const &e)
+	{
+		std::cerr << "Error: " << e.what() << std::endl;
+	}
+
 	ev_accept = event_new(evbase_accept, listenfd, EV_READ|EV_PERSIST,
-			on_accept, (void *)&workqueue);
+			on_accept, NULL);//(void *)&workqueue);
 	event_add(ev_accept, NULL);
 
 	printf("Server running.\n");
@@ -402,7 +636,7 @@ void killServer(void) {
 		perror("Error shutting down server");
 	}
 	fprintf(stdout, "Stopping workers.\n");
-	workqueue_shutdown(&workqueue);
+	//workqueue_shutdown(&workqueue);
 }
 
 static void sighandler(int signal) {
